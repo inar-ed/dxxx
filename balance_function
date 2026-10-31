@@ -1,0 +1,147 @@
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    Integer,
+    create_engine,
+    select,
+    update,
+)
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    sessionmaker,
+)
+
+engine = create_engine(
+    "sqlite:///shop.db",
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
+SessionLocal = sessionmaker(engine)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Account(Base):
+    __tablename__ = "accounts"
+    __table_args__ = (CheckConstraint("balance >= 0"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    balance: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Product(Base):
+    __tablename__ = "products"
+    __table_args__ = (CheckConstraint("price > 0"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    seller_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    price: Mapped[int] = mapped_column(Integer)
+
+
+class Purchase(Base):
+    __tablename__ = "purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    buyer_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    seller_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    amount: Mapped[int] = mapped_column(Integer)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(engine)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_db():
+    with SessionLocal() as db:
+        yield db
+
+
+Database = Annotated[Session, Depends(get_db)]
+
+
+class BuyRequest(BaseModel):
+    # Для примера. В реальном приложении buyer_id берётся
+    # из авторизованного пользователя, а не из тела запроса.
+    buyer_id: int = Field(gt=0)
+
+
+@app.post("/products/{product_id}/buy", status_code=201)
+def buy_product(product_id: int, body: BuyRequest, db: Database):
+    with db.begin():
+        product = db.scalar(
+            select(Product)
+            .where(Product.id == product_id)
+            .with_for_update()
+        )
+        if product is None:
+            raise HTTPException(404, "Товар не найден")
+
+        if body.buyer_id == product.seller_id:
+            raise HTTPException(400, "Нельзя купить собственный товар")
+
+        # Одинаковый порядок блокировок снижает риск deadlock
+        # при встречных переводах в PostgreSQL.
+        accounts = db.scalars(
+            select(Account)
+            .where(Account.id.in_([body.buyer_id, product.seller_id]))
+            .order_by(Account.id)
+            .with_for_update()
+        ).all()
+
+        account_ids = {account.id for account in accounts}
+        if body.buyer_id not in account_ids:
+            raise HTTPException(404, "Покупатель не найден")
+        if product.seller_id not in account_ids:
+            raise HTTPException(409, "Счёт продавца не найден")
+
+        debit = db.execute(
+            update(Account)
+            .where(
+                Account.id == body.buyer_id,
+                Account.balance >= product.price,
+            )
+            .values(balance=Account.balance - product.price)
+            .execution_options(synchronize_session=False)
+        )
+        if debit.rowcount != 1:
+            raise HTTPException(409, "Недостаточно средств")
+
+        credit = db.execute(
+            update(Account)
+            .where(Account.id == product.seller_id)
+            .values(balance=Account.balance + product.price)
+            .execution_options(synchronize_session=False)
+        )
+        if credit.rowcount != 1:
+            raise HTTPException(409, "Не удалось зачислить деньги продавцу")
+
+        purchase = Purchase(
+            product_id=product.id,
+            buyer_id=body.buyer_id,
+            seller_id=product.seller_id,
+            amount=product.price,
+        )
+        db.add(purchase)
+        db.flush()
+
+        result = {
+            "purchase_id": purchase.id,
+            "amount": purchase.amount,
+            "status": "paid",
+        }
+    return result
